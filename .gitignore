@@ -19,6 +19,14 @@ venv/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# AI/Agent metadata
+GEMINI.md
+.gemini/
+.geminiignore
+MEMORY.md
+superpowers/
+.agent/
+
 # OS
 .DS_Store
 Thumbs.db
