@@ -33,31 +33,135 @@ def apply_feature_masking(df: pd.DataFrame, drop_sensitive: bool = True) -> pd.D
     return df
 
 
+def detect_proxy_features(
+    df: pd.DataFrame, 
+    sensitive_cols: list[str], 
+    threshold: float = 0.5
+) -> list[str]:
+    """
+    Identifies features that are highly correlated with sensitive columns.
+    These 'proxy' features can leak private information if included in explanations.
+    """
+    # Use only numeric columns for correlation (or encoded versions)
+    numeric_df = df.select_dtypes(include=[np.number])
+    
+    proxies = set()
+    for s_col in sensitive_cols:
+        # Check if sensitive col is in the numeric df (might be encoded)
+        s_target = s_col if s_col in numeric_df.columns else f"{s_col}_enc"
+        if s_target not in numeric_df.columns:
+            continue
+            
+        correlations = numeric_df.corr()[s_target].abs()
+        high_corr = correlations[correlations > threshold].index.tolist()
+        
+        for feature in high_corr:
+            if feature != s_target and not feature.startswith(tuple(sensitive_cols)):
+                proxies.add(feature)
+                
+    print(f"Detected {len(proxies)} proxy features with correlation > {threshold}: {list(proxies)}")
+    return list(proxies)
+
+
 def suppress_sensitive_from_explanation(
     shap_values: pd.Series,
-    sensitive_encoded_cols: list[str],
+    sensitive_cols: list[str],
+    proxy_cols: list[str] = None
 ) -> pd.Series:
     """
-    Removes sensitive encoded columns from a SHAP Series before surfacing to users.
-    Used by explainability module to enforce privacy-aware explanations.
+    Removes sensitive and proxy columns from a SHAP Series.
     """
+    proxy_cols = proxy_cols or []
+    to_drop = []
+    
+    # Identify encoded sensitive columns
+    for col in sensitive_cols:
+        to_drop.append(col)
+        to_drop.append(f"{col}_enc")
+        
+    to_drop.extend(proxy_cols)
+    
     return shap_values.drop(
-        labels=[c for c in sensitive_encoded_cols if c in shap_values.index],
+        labels=[c for c in to_drop if c in shap_values.index],
         errors="ignore",
     )
 
 
-def check_k_anonymity(df: pd.DataFrame, quasi_identifiers: list[str], k: int = 5) -> pd.DataFrame:
+def enforce_k_anonymity(
+    df: pd.DataFrame, 
+    quasi_identifiers: list[str], 
+    k: int = 5,
+    action: str = "suppress"
+) -> pd.DataFrame:
     """
-    Returns groups that violate k-anonymity (fewer than k records with the same QI combination).
-    These rows represent re-identification risk.
+    Ensures the DataFrame satisfies k-anonymity for the given quasi-identifiers.
+    
+    Args:
+        df: Input DataFrame.
+        quasi_identifiers: Columns that could be used for re-identification.
+        k: Minimum group size.
+        action: 'suppress' to remove rows in small groups, or 'mask' to replace them with NaN.
+    
+    Returns:
+        A k-anonymous DataFrame.
     """
-    present_qi = [q for q in quasi_identifiers if q in df.columns]
-    counts = df.groupby(present_qi).size().reset_index(name="count")
-    violations = counts[counts["count"] < k]
-    if violations.empty:
-        print(f"k-anonymity satisfied for k={k} across {present_qi}")
+    df_clean = df.copy()
+    present_qi = [q for q in quasi_identifiers if q in df_clean.columns]
+    
+    # Calculate group sizes
+    group_counts = df_clean.groupby(present_qi).size().reset_index(name="_k_count")
+    df_with_counts = df_clean.merge(group_counts, on=present_qi, how="left")
+    
+    # Identify rows that violate k-anonymity
+    violators_mask = df_with_counts["_k_count"] < k
+    
+    if action == "suppress":
+        # Remove the rows entirely
+        df_result = df_clean[~violators_mask].copy()
+    elif action == "mask":
+        # Keep the rows but mask the quasi-identifiers
+        df_clean.loc[violators_mask, present_qi] = np.nan
+        df_result = df_clean
     else:
-        print(f"{len(violations)} quasi-identifier groups violate k={k}:")
-        print(violations)
-    return violations
+        raise ValueError("Action must be 'suppress' or 'mask'")
+        
+    print(f"k-anonymity ({k}) enforced. Action: {action}. Rows affected: {violators_mask.sum()}")
+    return df_result
+
+
+def generalize_categorical(
+    df: pd.DataFrame, 
+    column: str, 
+    mapping: dict
+) -> pd.DataFrame:
+    """
+    Generalizes a categorical column based on a provided hierarchy mapping.
+    Helps satisfy k-anonymity by reducing granularity.
+    """
+    df = df.copy()
+    if column in df.columns:
+        df[column] = df[column].map(mapping).fillna(df[column])
+    return df
+
+
+def get_default_generalization_maps() -> dict:
+    """Provides standard generalization hierarchies for OULAD sensitive features."""
+    return {
+        "imd_band": {
+            "0-10%": "0-30%", "10-20%": "0-30%", "20-30%": "0-30%",
+            "30-40%": "30-60%", "40-50%": "30-60%", "50-60%": "30-60%",
+            "60-70%": "60-100%", "70-80%": "60-100%", "80-90%": "60-100%", "90-100%": "60-100%",
+        },
+        "age_band": {
+            "0-35": "Under 55",
+            "35-55": "Under 55",
+            "55<=": "Over 55"
+        },
+        "highest_education": {
+            "No Formal quals": "Pre-HE",
+            "Lower Than A Level": "Pre-HE",
+            "A Level or Equivalent": "HE Entry",
+            "HE Qualification": "Post-Secondary",
+            "Post Graduate Qualification": "Post-Secondary"
+        }
+    }
